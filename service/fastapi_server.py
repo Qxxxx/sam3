@@ -20,6 +20,7 @@ from typing import Optional, List
 
 import torch
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from PIL import Image
@@ -28,16 +29,36 @@ import io
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Temporary directory for uploaded videos
-UPLOAD_DIR = tempfile.mkdtemp(prefix="sam3_uploads_")
+# Persistent directory for uploaded videos
+UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "sam3_uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 logger.info(f"📁 Upload directory: {UPLOAD_DIR}")
 
 
 # ==================== Models ====================
 
 class StartSessionRequest(BaseModel):
-    resource_path: str
+    resource_path: Optional[str] = None
+    video_id: Optional[str] = None
     session_id: Optional[str] = None
+
+
+class UploadVideoResponse(BaseModel):
+    video_id: str
+    resource_path: str
+    file_size_mb: float
+
+
+class VideoInfo(BaseModel):
+    video_id: str
+    resource_path: str
+    file_size_mb: float
+    filename: str
+
+
+class VideoListResponse(BaseModel):
+    videos: List[VideoInfo]
+    total: int
 
 
 class StartSessionResponse(BaseModel):
@@ -74,6 +95,8 @@ class SAM3Worker:
 
         # Track uploaded files per session for cleanup
         self.session_temp_files = {}  # session_id -> temp_file_path
+        # Track uploaded videos by video_id
+        self.uploaded_videos = {}  # video_id -> resource_path
 
     def start(self):
         """Start worker thread and load models"""
@@ -82,7 +105,26 @@ class SAM3Worker:
         if not self.ready.wait(timeout=120):
             raise RuntimeError("Model loading timeout")
 
+        # Load existing videos from upload directory
+        self._load_existing_videos()
+
         logger.info("✅ Worker ready")
+
+    def _load_existing_videos(self):
+        """Load existing videos from upload directory on startup"""
+        if not os.path.exists(UPLOAD_DIR):
+            return
+
+        for filename in os.listdir(UPLOAD_DIR):
+            file_path = os.path.join(UPLOAD_DIR, filename)
+            if os.path.isfile(file_path):
+                # Extract video_id from filename (format: {video_id}.ext)
+                video_id = os.path.splitext(filename)[0]
+                self.uploaded_videos[video_id] = file_path
+                logger.info(f"📂 Loaded existing video: {video_id} -> {file_path}")
+
+        if self.uploaded_videos:
+            logger.info(f"📂 Loaded {len(self.uploaded_videos)} existing videos from {UPLOAD_DIR}")
 
     def _worker_loop(self):
         """Main worker loop - processes requests sequentially"""
@@ -172,6 +214,14 @@ class SAM3Worker:
             try:
                 os.remove(temp_file)
                 logger.info(f"🗑️  Deleted temp file for session {session_id}: {temp_file}")
+                # Also remove from uploaded_videos if it exists there
+                video_id_to_remove = None
+                for vid_id, path in self.uploaded_videos.items():
+                    if path == temp_file:
+                        video_id_to_remove = vid_id
+                        break
+                if video_id_to_remove:
+                    self.uploaded_videos.pop(video_id_to_remove, None)
             except Exception as e:
                 logger.error(f"Failed to delete temp file {temp_file}: {e}")
 
@@ -223,16 +273,19 @@ async def lifespan(app: FastAPI):
     if worker:
         worker.shutdown_flag.set()
 
-    # Clean up upload directory
-    if os.path.exists(UPLOAD_DIR):
-        try:
-            shutil.rmtree(UPLOAD_DIR)
-            logger.info(f"🗑️  Cleaned up upload directory: {UPLOAD_DIR}")
-        except Exception as e:
-            logger.error(f"Failed to clean upload directory: {e}")
+    logger.info(f"📁 Upload directory preserved: {UPLOAD_DIR}")
 
 
 app = FastAPI(title="SAM 3 Service", version="1.0.0", lifespan=lifespan)
+
+# Configure CORS to allow frontend requests from any origin (LAN-accessible)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins for LAN access
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 
 # ==================== Endpoints ====================
@@ -272,22 +325,92 @@ async def segment_image(
 @app.post("/api/v1/video/session/start")
 async def start_session(req: StartSessionRequest):
     """
-    Start video session from a local server path.
+    Start video session and load frames (this is when OpenCV splits the video).
 
-    Use this endpoint when the video is already on the server.
-    For uploading videos, use POST /api/v1/video/session/upload instead.
+    You can provide either:
+    - video_id: from a previous POST /api/v1/video/upload
+    - resource_path: direct path to video file on server
+
+    This endpoint loads ALL video frames into memory, which can take time
+    for large videos.
     """
+    # Resolve video_id to resource_path if provided
+    if req.video_id:
+        resource_path = worker.uploaded_videos.get(req.video_id)
+        if not resource_path:
+            raise HTTPException(404, f"Video ID not found: {req.video_id}")
+        is_uploaded = True
+    elif req.resource_path:
+        resource_path = req.resource_path
+        is_uploaded = False
+    else:
+        raise HTTPException(400, "Must provide either video_id or resource_path")
+
+    # Start session (this loads frames)
     result = await worker.submit("video", {
         "type": "start_session",
-        "resource_path": req.resource_path,
-        "session_id": req.session_id
+        "resource_path": resource_path,
+        "session_id": req.session_id,
+        "_temp_file": resource_path if is_uploaded else None
     }, timeout=60.0)
 
     return StartSessionResponse(
         session_id=result["session_id"],
-        resource_path=req.resource_path,
-        uploaded=False
+        resource_path=resource_path,
+        uploaded=is_uploaded
     )
+
+
+@app.post("/api/v1/video/upload", response_model=UploadVideoResponse)
+async def upload_video(
+    file: UploadFile = File(..., description="Video file (MP4, AVI, MOV, etc.)")
+):
+    """
+    Upload a video file WITHOUT starting a session.
+
+    This only saves the video to the server. To process it, call
+    POST /api/v1/video/session/start with the returned video_id.
+
+    Supported formats: MP4, AVI, MOV, MKV, etc.
+    """
+    # Validate file extension
+    filename = file.filename or "video.mp4"
+    file_ext = Path(filename).suffix.lower()
+    allowed_extensions = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv"}
+
+    if file_ext not in allowed_extensions:
+        raise HTTPException(
+            400,
+            f"Unsupported video format: {file_ext}. "
+            f"Allowed: {', '.join(allowed_extensions)}"
+        )
+
+    # Generate unique video ID
+    video_id = str(uuid.uuid4())
+    temp_path = os.path.join(UPLOAD_DIR, f"{video_id}{file_ext}")
+
+    # Save uploaded file
+    try:
+        with open(temp_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+        file_size_mb = len(content) / (1024 * 1024)
+        logger.info(f"📤 Uploaded video: {filename} ({file_size_mb:.1f} MB) -> {temp_path}")
+
+        # Register video in worker
+        worker.uploaded_videos[video_id] = temp_path
+
+        return UploadVideoResponse(
+            video_id=video_id,
+            resource_path=temp_path,
+            file_size_mb=round(file_size_mb, 2)
+        )
+
+    except Exception as e:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise HTTPException(500, f"Failed to save video: {str(e)}")
 
 
 @app.post("/api/v1/video/session/upload", response_model=StartSessionResponse)
@@ -296,12 +419,15 @@ async def upload_and_start_session(
     session_id: Optional[str] = Form(None, description="Optional custom session ID")
 ):
     """
-    Upload a video file and start a tracking session.
+    Upload a video file and start a tracking session (combined operation).
 
     The video is saved temporarily on the server and will be automatically
     deleted when the session is closed.
 
     Supported formats: MP4, AVI, MOV, MKV, etc.
+
+    For more control, use POST /api/v1/video/upload followed by
+    POST /api/v1/video/session/start separately.
     """
     # Validate file extension
     filename = file.filename or "video.mp4"
@@ -380,6 +506,44 @@ async def propagate(req: PropagateRequest):
     }, timeout=300.0)
 
     return result
+
+
+@app.get("/api/v1/video/list", response_model=VideoListResponse)
+async def list_videos():
+    """List all uploaded videos"""
+    videos = []
+    for video_id, resource_path in worker.uploaded_videos.items():
+        if os.path.exists(resource_path):
+            file_size = os.path.getsize(resource_path)
+            file_size_mb = file_size / (1024 * 1024)
+            filename = os.path.basename(resource_path)
+            videos.append(VideoInfo(
+                video_id=video_id,
+                resource_path=resource_path,
+                file_size_mb=round(file_size_mb, 2),
+                filename=filename
+            ))
+
+    return VideoListResponse(videos=videos, total=len(videos))
+
+
+@app.delete("/api/v1/video/upload/{video_id}")
+async def delete_uploaded_video(video_id: str):
+    """Delete an uploaded video file that hasn't been used in a session yet"""
+    resource_path = worker.uploaded_videos.pop(video_id, None)
+    if not resource_path:
+        raise HTTPException(404, f"Video ID not found: {video_id}")
+
+    if os.path.exists(resource_path):
+        try:
+            os.remove(resource_path)
+            logger.info(f"🗑️  Deleted uploaded video {video_id}: {resource_path}")
+            return {"is_success": True, "video_id": video_id}
+        except Exception as e:
+            logger.error(f"Failed to delete video {resource_path}: {e}")
+            raise HTTPException(500, f"Failed to delete video: {str(e)}")
+    else:
+        return {"is_success": True, "video_id": video_id, "note": "File already deleted"}
 
 
 @app.delete("/api/v1/video/session/{session_id}")
