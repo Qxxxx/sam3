@@ -251,6 +251,24 @@ class Sam3VideoPredictor:
             logger.info(f"removed session {session_id}; {self._get_session_stats()}")
         return {"is_success": True}
 
+    def get_session_info(self, session_id):
+        """Return read-only metadata for a single live session."""
+        session = self._get_session(session_id)
+        state = session["state"]
+        resource_type = "image" if state.get("is_image_only", False) else "video"
+        return {
+            "session_id": session_id,
+            "num_frames": state.get("num_frames", 0),
+            "orig_width": state.get("orig_width", 0),
+            "orig_height": state.get("orig_height", 0),
+            "resource_type": resource_type,
+            "start_time": session.get("start_time"),
+        }
+
+    def list_sessions(self):
+        """Return read-only metadata for all live sessions."""
+        return [self.get_session_info(session_id) for session_id in self._ALL_INFERENCE_STATES]
+
     def _get_session(self, session_id):
         session = self._ALL_INFERENCE_STATES.get(session_id, None)
         if session is None:
