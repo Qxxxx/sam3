@@ -237,6 +237,26 @@ def _model_to_dict(model: BaseModel) -> Dict[str, Any]:
     return model.dict()
 
 
+def _to_builtin_jsonable(value: Any) -> Any:
+    """Recursively normalize numpy/torch values to Python built-in types."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return [_to_builtin_jsonable(item) for item in value.tolist()]
+    if isinstance(value, torch.Tensor):
+        return _to_builtin_jsonable(value.detach().cpu().tolist())
+    if isinstance(value, dict):
+        return {str(key): _to_builtin_jsonable(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_builtin_jsonable(item) for item in value]
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.decode("utf-8", errors="replace")
+    return value
+
+
 # ==================== Worker Thread ====================
 
 class SAM3Worker:
@@ -591,8 +611,8 @@ class SAM3Worker:
         }
         frame_stats = outputs.get("frame_stats")
         if frame_stats is not None:
-            response["frame_stats"] = frame_stats
-        return response
+            response["frame_stats"] = _to_builtin_jsonable(frame_stats)
+        return _to_builtin_jsonable(response)
 
     def _prompt_points(self, data: Dict[str, Any]) -> Dict[str, Any]:
         session_id = data["session_id"]
@@ -637,8 +657,8 @@ class SAM3Worker:
         }
         frame_stats = outputs.get("frame_stats")
         if frame_stats is not None:
-            response["frame_stats"] = frame_stats
-        return response
+            response["frame_stats"] = _to_builtin_jsonable(frame_stats)
+        return _to_builtin_jsonable(response)
 
     def _propagate(self, data: Dict[str, Any]) -> Dict[str, Any]:
         session_id = data["session_id"]
@@ -664,11 +684,13 @@ class SAM3Worker:
             }
             frame_stats = outputs.get("frame_stats")
             if frame_stats is not None:
-                frame_response["frame_stats"] = frame_stats
+                frame_response["frame_stats"] = _to_builtin_jsonable(frame_stats)
             frames.append(frame_response)
 
         self.session_store[session_id].last_access_at = time.time()
-        return {"session_id": session_id, "total_frames": len(frames), "frames": frames}
+        return _to_builtin_jsonable(
+            {"session_id": session_id, "total_frames": len(frames), "frames": frames}
+        )
 
     def _format_objects(self, outputs: Dict[str, Any]) -> List[Dict[str, Any]]:
         obj_ids = np.asarray(outputs.get("out_obj_ids", []), dtype=np.int64)
@@ -690,13 +712,15 @@ class SAM3Worker:
                     "obj_id": int(obj_ids[i]),
                     "score": float(scores[i]),
                     "bbox_xywh_norm": [float(v) for v in boxes[i].tolist()],
-                    "mask_rle": {
-                        "size": mask_rle.get("size", [0, 0]),
-                        "counts": mask_rle.get("counts", ""),
-                    },
+                    "mask_rle": _to_builtin_jsonable(
+                        {
+                            "size": mask_rle.get("size", [0, 0]),
+                            "counts": mask_rle.get("counts", ""),
+                        }
+                    ),
                 }
             )
-        return objects
+        return _to_builtin_jsonable(objects)
 
     def _cleanup_expired_sessions(self) -> None:
         if SESSION_TTL_SEC <= 0:
